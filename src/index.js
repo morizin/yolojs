@@ -1,12 +1,9 @@
-import React, { Component } from "react";
+import React, { useEffect, useRef } from "react";
 import ReactDOM from "react-dom";
-import MagicDropzone from "react-magic-dropzone";
 import * as tf from "@tensorflow/tfjs";
 import "@tensorflow/tfjs";
 
 import "./styles.css";
-
-const weights = "/web_model/model.json";
 
 const names = [
   "person",
@@ -88,163 +85,112 @@ const names = [
   "scissors",
   "teddy bear",
   "hair drier",
-  "toothbrush"
+  "toothbrush",
 ];
 
-class App extends Component {
-  state = {
-    model: null,
-    preview: "",
-    predictions: []
-  };
+const App = () => {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
 
-  componentDidMount() {
-    tf.loadGraphModel(weights).then((model) => {
-      this.setState({
-        model: model
-      });
-    });
-    this.startVideoStream();
-  }
+  useEffect(() => {
+    const runObjectDetection = async () => {
+      await tf.setBackend("webgl");
 
-  startVideoStream = async () => {
-    try {
-      const video = document.getElementById("video");
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment" }
-      });
-      video.srcObject = stream;
-    } catch (err) {
-      console.error("Error accessing the camera", err);
-    }
-  };
+      const model = await tf.loadGraphModel("/web_model/model.json");
 
-  stopVideoStream = () => {
-    const video = document.getElementById("video");
-    const stream = video.srcObject;
-    const tracks = stream.getTracks();
-    tracks.forEach((track) => {
-      track.stop();
-    });
-  };
+      const videoElement = videoRef.current;
+      const canvasElement = canvasRef.current;
+      const context = canvasElement.getContext("2d");
 
-  onDrop = (accepted, rejected, links) => {
-    this.setState({ preview: accepted[0].preview || links[0] });
-  };
+      const handleFrame = () => {
+        tf.nextFrame().then(() => {
+          context.drawImage(
+            videoElement,
+            0,
+            0,
+            videoElement.width,
+            videoElement.height
+          );
 
-  cropToCanvas = (image, canvas, ctx) => {
-    const naturalWidth = image.naturalWidth;
-    const naturalHeight = image.naturalHeight;
+          model.executeAsync(
+            tf.browser.fromPixels(videoElement).expandDims()
+          )
+            .then((result) => {
+              const [boxes, scores, classes, numDetections] = result;
 
-    ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-    ctx.fillStyle = "#000000";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    const ratio = Math.min(
-      canvas.width / image.naturalWidth,
-      canvas.height / image.naturalHeight
-    );
-    const newWidth = Math.round(naturalWidth * ratio);
-    const newHeight = Math.round(naturalHeight * ratio);
-    ctx.drawImage(
-      image,
-      0,
-      0,
-      naturalWidth,
-      naturalHeight,
-      (canvas.width - newWidth) / 2,
-      (canvas.height - newHeight) / 2,
-      newWidth,
-      newHeight
-    );
-  };
+              const boxesData = boxes.arraySync()[0];
+              const scoresData = scores.arraySync()[0];
+              const classesData = classes.arraySync()[0];
+              const numDetectionsData = numDetections.arraySync()[0];
 
-  onImageChange = (e) => {
-    const c = document.getElementById("canvas");
-    const ctx = c.getContext("2d");
-    this.cropToCanvas(e.target, c, ctx);
-    let [modelWidth, modelHeight] = this.state.model.inputs[0].shape.slice(1, 3);
-    const input = tf.tidy(() => {
-      return tf
-        .image.resizeBilinear(tf.browser.fromPixels(c), [modelWidth, modelHeight])
-        .div(255.0)
-        .expandDims(0);
-    });
-    this.state.model.executeAsync(input).then((res) => {
-      // Font options.
-      const font = "16px sans-serif";
-      ctx.font = font;
-      ctx.textBaseline = "top";
+              context.clearRect(
+                0,
+                0,
+                canvasElement.width,
+                canvasElement.height
+              );
 
-      const [boxes, scores, classes, valid_detections] = res;
-      const boxes_data = boxes.dataSync();
-      const scores_data = scores.dataSync();
-      const classes_data = classes.dataSync();
-      const valid_detections_data = valid_detections.dataSync()[0];
+              for (let i = 0; i < numDetectionsData; i++) {
+                const [y, x, height, width] = boxesData[i];
+                const score = scoresData[i];
+                const classIndex = classesData[i];
 
-      tf.dispose(res);
+                if (score > 0.5) {
+                  const label = names[classIndex];
+                  context.beginPath();
+                  context.rect(
+                    x * videoElement.width,
+                    y * videoElement.height,
+                    width * videoElement.width,
+                    height * videoElement.height
+                  );
+                  context.lineWidth = 2;
+                  context.strokeStyle = "red";
+                  context.fillStyle = "red";
+                  context.stroke();
+                  context.fillText(
+                    `${label} (${(score * 100).toFixed(1)}%)`,
+                    x * videoElement.width + 5,
+                    y * videoElement.height + 16
+                  );
+                  context.closePath();
+                }
+              }
 
-      for (let i = 0; i < valid_detections_data; ++i) {
-        let [x1, y1, x2, y2] = boxes_data.slice(i * 4, (i + 1) * 4);
-        x1 *= c.width;
-        x2 *= c.width;
-        y1 *= c.height;
-        y2 *= c.height;
-        const width = x2 - x1;
-        const height = y2 - y1;
-        const klass = names[classes_data[i]];
-        const score = scores_data[i].toFixed(2);
+              tf.dispose([boxes, scores, classes, numDetections]);
 
-        // Draw the bounding box.
-        ctx.strokeStyle = "#00FFFF";
-        ctx.lineWidth = 4;
-        ctx.strokeRect(x1, y1, width, height);
+              requestAnimationFrame(handleFrame);
+            });
+        });
+      };
 
-        // Draw the label background.
-        ctx.fillStyle = "#00FFFF";
-        const textWidth = ctx.measureText(klass + ":" + score).width;
-        const textHeight = parseInt(font, 10); // base 10
-        ctx.fillRect(x1, y1, textWidth + 4, textHeight + 4);
+      navigator.mediaDevices
+        .getUserMedia({ video: true })
+        .then((stream) => {
+          videoElement.srcObject = stream;
+          videoElement.onloadedmetadata = () => {
+            videoElement.play();
+            handleFrame();
+          };
+        })
+        .catch((error) => {
+          console.error("Error accessing webcam:", error);
+        });
+    };
 
-        // Draw the text last to ensure it's on top.
-        ctx.fillStyle = "#000000";
-        ctx.fillText(klass + ":" + score, x1, y1);
-      }
-    });
-  };
+    runObjectDetection();
+  }, []);
 
-  componentWillUnmount() {
-    this.stopVideoStream();
-  }
-
-  render() {
-    return (
-      <div className="Dropzone-page">
-        {this.state.model ? (
-          <MagicDropzone
-            className="Dropzone"
-            accept="image/jpeg, image/png, .jpg, .jpeg, .png"
-            multiple={false}
-            onDrop={this.onDrop}
-          >
-            {this.state.preview ? (
-              <img
-                alt="upload preview"
-                onLoad={this.onImageChange}
-                className="Dropzone-img"
-                src={this.state.preview}
-              />
-            ) : (
-              <video id="video" autoPlay playsInline className="Dropzone-video" />
-            )}
-            <canvas id="canvas" width="640" height="640" />
-          </MagicDropzone>
-        ) : (
-          <div className="Dropzone">Loading model...</div>
-        )}
+  return (
+    <div className="App">
+      <h1>Real-Time Object Detection</h1>
+      <div className="CanvasContainer">
+        <video className="Video" ref={videoRef} />
+        <canvas className="Canvas" ref={canvasRef} />
       </div>
-    );
-  }
-}
+    </div>
+  );
+};
 
 const rootElement = document.getElementById("root");
 ReactDOM.render(<App />, rootElement);
